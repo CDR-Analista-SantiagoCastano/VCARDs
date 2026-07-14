@@ -23,12 +23,34 @@ IGNORED_FILES = {
     "Dockerfile",
 }
 
+TITLE_PATTERN = re.compile(r"<title>\s*(.*?)\s*</title>", re.IGNORECASE | re.DOTALL)
+
 
 def slugify(value: str) -> str:
     normalized = unicodedata.normalize("NFKD", value)
     ascii_value = normalized.encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_value.lower()).strip("-")
     return slug or "vcard"
+
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(value)).strip()
+
+
+def read_display_name(index_path: Path, fallback: str) -> str:
+    content = index_path.read_text(encoding="utf-8", errors="ignore")
+    match = TITLE_PATTERN.search(content)
+
+    if match:
+        title = clean_text(match.group(1))
+        if title:
+            return title
+
+    return fallback
+
+
+def name_tokens(value: str) -> list[str]:
+    return [token for token in slugify(value).split("-") if token]
 
 
 def should_skip(path: Path, root: Path) -> bool:
@@ -51,8 +73,9 @@ def discover_sites(root: Path) -> list[dict[str, str | Path]]:
         if site_dir == root:
             continue
 
-        display_name = site_dir.parent.name if site_dir.parent != root else site_dir.name
-        slug = slugify(display_name)
+        folder_name = site_dir.parent.name if site_dir.parent != root else site_dir.name
+        display_name = read_display_name(index_path, folder_name)
+        slug = slugify(folder_name)
         original_slug = slug
         counter = 2
 
@@ -64,19 +87,112 @@ def discover_sites(root: Path) -> list[dict[str, str | Path]]:
         sites.append(
             {
                 "display_name": display_name,
+                "name_slug": slugify(display_name),
                 "slug": slug,
                 "source": site_dir,
             }
         )
 
-    return sorted(sites, key=lambda site: str(site["display_name"]).casefold())
+    sites = sorted(sites, key=lambda site: str(site["display_name"]).casefold())
+    add_aliases(sites)
+    return sites
+
+
+def add_aliases(sites: list[dict[str, str | Path]]) -> None:
+    prefix_options: dict[int, list[str]] = {}
+
+    for index, site in enumerate(sites):
+        tokens = name_tokens(str(site["display_name"]))
+        prefix_options[index] = ["-".join(tokens[:length]) for length in range(1, len(tokens) + 1)]
+
+    all_prefixes = [
+        prefix
+        for prefixes in prefix_options.values()
+        for prefix in prefixes
+    ]
+
+    for index, site in enumerate(sites):
+        aliases = {str(site["slug"]), str(site["name_slug"])}
+
+        for prefix in prefix_options[index]:
+            if all_prefixes.count(prefix) == 1:
+                aliases.add(prefix)
+                break
+
+        site["aliases"] = sorted(alias for alias in aliases if alias)
+
+
+def apply_custom_aliases(root: Path, sites: list[dict[str, str | Path]]) -> None:
+    aliases_path = root / "docker" / "aliases.json"
+    if not aliases_path.exists():
+        return
+
+    data = json.loads(aliases_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("docker/aliases.json must be a JSON object.")
+
+    for site in sites:
+        site["aliases"] = [str(site["slug"])]
+
+    sites_by_slug = {
+        str(site["slug"]): site
+        for site in sites
+    }
+    sites_by_slug.update(
+        {
+            str(site["name_slug"]): site
+            for site in sites
+        }
+    )
+
+    for target, aliases in data.items():
+        target_slug = slugify(str(target))
+        site = sites_by_slug.get(target_slug)
+        if site is None:
+            valid_targets = ", ".join(sorted(sites_by_slug))
+            raise ValueError(
+                f"Unknown vCard target '{target}' in docker/aliases.json. "
+                f"Valid targets are: {valid_targets}"
+            )
+
+        if isinstance(aliases, str):
+            aliases = [aliases]
+
+        if not isinstance(aliases, list):
+            raise ValueError(
+                f"Aliases for '{target}' must be a string or a list of strings."
+            )
+
+        current_aliases = set(site["aliases"])
+        for alias in aliases:
+            alias_slug = slugify(str(alias))
+            if alias_slug:
+                current_aliases.add(alias_slug)
+
+        site["aliases"] = sorted(current_aliases)
+
+    validate_aliases(sites)
+
+
+def validate_aliases(sites: list[dict[str, str | Path]]) -> None:
+    used_aliases: dict[str, str] = {}
+
+    for site in sites:
+        for alias in site["aliases"]:
+            existing_site = used_aliases.get(alias)
+            if existing_site:
+                raise ValueError(
+                    f"Alias '{alias}' is assigned to both '{existing_site}' "
+                    f"and '{site['slug']}' in docker/aliases.json."
+                )
+            used_aliases[alias] = str(site["slug"])
 
 
 def copy_site(source: Path, destination: Path) -> None:
     destination.mkdir(parents=True, exist_ok=True)
 
     for item in source.iterdir():
-        if item.name in IGNORED_FILES:
+        if item.name in IGNORED_DIRS or item.name in IGNORED_FILES:
             continue
 
         target = destination / item.name
@@ -178,22 +294,60 @@ def build_index(sites: list[dict[str, str | Path]]) -> str:
 """
 
 
+def build_nginx_host_map(sites: list[dict[str, str | Path]]) -> str:
+    alias_lines = []
+
+    for site in sites:
+        for alias in site["aliases"]:
+            alias_lines.append(f"    {alias} {site['slug']};")
+
+    prefix_lines = [
+        f"    {site['slug']} /{site['slug']};"
+        for site in sites
+    ]
+
+    return f"""# Generated by docker/build_vcards.py.
+# Maps subdomains such as cesar.example.com to the vCard folder.
+map $host $vcard_subdomain {{
+    default "";
+    ~^(?<vcard_first_label>[^.]+)\\..+$ $vcard_first_label;
+}}
+
+map $vcard_subdomain $vcard_slug {{
+    default "";
+{chr(10).join(alias_lines)}
+}}
+
+map $vcard_slug $vcard_prefix {{
+    default "";
+{chr(10).join(prefix_lines)}
+}}
+"""
+
+
 def main() -> int:
-    if len(sys.argv) != 3:
-        print("Usage: build_vcards.py <source-root> <output-root>", file=sys.stderr)
+    if len(sys.argv) not in {3, 4}:
+        print("Usage: build_vcards.py <source-root> <output-root> [nginx-output-root]", file=sys.stderr)
         return 2
 
     source_root = Path(sys.argv[1]).resolve()
     output_root = Path(sys.argv[2]).resolve()
+    nginx_output_root = Path(sys.argv[3]).resolve() if len(sys.argv) == 4 else None
 
     if output_root.exists():
         shutil.rmtree(output_root)
     output_root.mkdir(parents=True)
 
+    if nginx_output_root:
+        if nginx_output_root.exists():
+            shutil.rmtree(nginx_output_root)
+        nginx_output_root.mkdir(parents=True)
+
     sites = discover_sites(source_root)
     if not sites:
         print("No vCard sites with index.html were found.", file=sys.stderr)
         return 1
+    apply_custom_aliases(source_root, sites)
 
     for site in sites:
         copy_site(Path(site["source"]), output_root / str(site["slug"]))
@@ -202,6 +356,7 @@ def main() -> int:
         {
             "name": str(site["display_name"]),
             "path": f"/{site['slug']}/",
+            "host_aliases": site["aliases"],
         }
         for site in sites
     ]
@@ -212,9 +367,15 @@ def main() -> int:
         encoding="utf-8",
     )
 
+    if nginx_output_root:
+        (nginx_output_root / "00-vcard-host-map.conf").write_text(
+            build_nginx_host_map(sites),
+            encoding="utf-8",
+        )
+
     print(f"Built {len(sites)} vCard routes:")
     for site in sites:
-        print(f"  /{site['slug']}/ <- {site['source']}")
+        print(f"  /{site['slug']}/ ({', '.join(site['aliases'])}) <- {site['source']}")
 
     return 0
 

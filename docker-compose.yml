@@ -1,0 +1,8 @@
+services:
+  vcards:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "6050:80"
+    restart: unless-stopped
